@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Logo } from "@/components/Logo";
 import { Button } from "@/components/ui/button";
@@ -6,12 +6,17 @@ import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/contexts/AuthContext";
 import { mockRooms, generateRoomId } from "@/lib/mockData";
-import { roomStore, makeDefault, defaultRoomPhotos, RoomSettings } from "@/lib/roomStore";
-import { Video, Plus, Calendar, LogOut, Users, ArrowRight, Copy, Camera, Shield } from "lucide-react";
+import { roomStore, makeDefault, defaultRoomPhotos, RoomSettings, RoomMeta } from "@/lib/roomStore";
+import { api, isApiEnabled, apiRoomToMeta } from "@/lib/api";
+import { Video, Plus, Calendar, LogOut, Users, ArrowRight, Copy, Camera, Shield, Trash2, Cloud, CloudOff } from "lucide-react";
 import { toast } from "sonner";
 
 const Dashboard = () => {
@@ -29,7 +34,32 @@ const Dashboard = () => {
     muteOnEntry: false,
   });
   const [generatedId, setGeneratedId] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [myRooms, setMyRooms] = useState<RoomMeta[]>([]);
+  const [loadingRooms, setLoadingRooms] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  const refreshRooms = async () => {
+    if (isApiEnabled()) {
+      try {
+        setLoadingRooms(true);
+        const { rooms } = await api.listRooms();
+        setMyRooms(rooms.map(apiRoomToMeta));
+      } catch (e) {
+        console.error(e);
+        toast.error("Could not load your rooms");
+      } finally {
+        setLoadingRooms(false);
+      }
+    } else if (user) {
+      // local fallback: read from localStorage roomStore
+      const all = JSON.parse(localStorage.getItem("safeguardmeet.rooms.v1") || "{}") as Record<string, RoomMeta>;
+      setMyRooms(Object.values(all).filter((r) => r.hostId === user.id).sort((a, b) => b.createdAt - a.createdAt));
+    }
+  };
+
+  useEffect(() => { refreshRooms(); /* eslint-disable-next-line */ }, [user?.id]);
+  useEffect(() => roomStore.subscribe(() => { if (!isApiEnabled()) refreshRooms(); }), []);
 
   const resetDialog = () => {
     setNewRoomName("");
@@ -37,9 +67,23 @@ const Dashboard = () => {
     setGeneratedId("");
   };
 
-  const startInstant = () => {
+  const startInstant = async () => {
+    if (!user) return;
+    if (isApiEnabled()) {
+      try {
+        const room = await api.createRoom({ name: "Instant meeting", photo: defaultRoomPhotos[0], settings });
+        roomStore.upsert(apiRoomToMeta(room));
+        navigate(`/room/${room.id}`);
+      } catch {
+        toast.error("Backend unreachable, starting locally");
+        const id = generateRoomId();
+        roomStore.upsert(makeDefault(id, user.id, user.name, "Instant meeting"));
+        navigate(`/room/${id}`);
+      }
+      return;
+    }
     const id = generateRoomId();
-    if (user) roomStore.upsert(makeDefault(id, user.id, user.name, "Instant meeting"));
+    roomStore.upsert(makeDefault(id, user.id, user.name, "Instant meeting"));
     navigate(`/room/${id}`);
   };
 
@@ -48,13 +92,42 @@ const Dashboard = () => {
     navigate(`/room/${joinCode.trim()}`);
   };
 
-  const createRoom = () => {
+  const createRoom = async () => {
     if (!user) return;
-    const id = generateRoomId();
-    const meta = makeDefault(id, user.id, user.name, newRoomName || "Untitled meeting", photo);
-    meta.settings = settings;
-    roomStore.upsert(meta);
-    setGeneratedId(id);
+    setCreating(true);
+    try {
+      if (isApiEnabled()) {
+        const room = await api.createRoom({ name: newRoomName || "Untitled meeting", photo, settings });
+        roomStore.upsert(apiRoomToMeta(room));
+        setGeneratedId(room.id);
+      } else {
+        const id = generateRoomId();
+        const meta = makeDefault(id, user.id, user.name, newRoomName || "Untitled meeting", photo);
+        meta.settings = settings;
+        roomStore.upsert(meta);
+        setGeneratedId(id);
+      }
+      refreshRooms();
+    } catch (e) {
+      console.error(e);
+      toast.error("Failed to create room");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const removeRoom = async (id: string) => {
+    try {
+      if (isApiEnabled()) await api.deleteRoom(id);
+      // also wipe local meta if present
+      const all = JSON.parse(localStorage.getItem("safeguardmeet.rooms.v1") || "{}");
+      delete all[id];
+      localStorage.setItem("safeguardmeet.rooms.v1", JSON.stringify(all));
+      toast.success("Room deleted");
+      refreshRooms();
+    } catch {
+      toast.error("Could not delete room");
+    }
   };
 
   const copyLink = () => {
@@ -77,6 +150,11 @@ const Dashboard = () => {
         <div className="container flex h-16 items-center justify-between">
           <Link to="/"><Logo /></Link>
           <div className="flex items-center gap-3">
+            <div className="hidden md:flex items-center gap-2 text-xs px-2.5 py-1 rounded-full border bg-muted/60">
+              {isApiEnabled()
+                ? (<><Cloud className="h-3.5 w-3.5 text-primary" /> <span>Cloud backend</span></>)
+                : (<><CloudOff className="h-3.5 w-3.5 text-muted-foreground" /> <span>Local preview</span></>)}
+            </div>
             <div className="hidden md:flex items-center gap-3">
               <Avatar className="h-9 w-9 ring-2 ring-primary/20">
                 <AvatarImage src={user?.avatar} />
@@ -124,7 +202,6 @@ const Dashboard = () => {
               <DialogHeader><DialogTitle>Create a meeting room</DialogTitle></DialogHeader>
               {!generatedId ? (
                 <div className="space-y-5">
-                  {/* Room photo */}
                   <div className="space-y-2">
                     <Label>Room photo</Label>
                     <div className="flex items-center gap-3">
@@ -162,7 +239,6 @@ const Dashboard = () => {
                     <Input value={newRoomName} onChange={(e) => setNewRoomName(e.target.value)} placeholder="Design Sync" />
                   </div>
 
-                  {/* Privileges */}
                   <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
                     <div className="flex items-center gap-2 text-sm font-semibold">
                       <Shield className="h-4 w-4 text-primary" /> Participant privileges
@@ -174,7 +250,9 @@ const Dashboard = () => {
                     <PrivToggle label="Mute participants on entry" checked={settings.muteOnEntry} onChange={(v) => setSettings((s) => ({ ...s, muteOnEntry: v }))} />
                   </div>
 
-                  <Button onClick={createRoom} className="w-full bg-brand-gradient text-primary-foreground">Generate room</Button>
+                  <Button onClick={createRoom} disabled={creating} className="w-full bg-brand-gradient text-primary-foreground">
+                    {creating ? "Creating..." : "Generate room"}
+                  </Button>
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -211,7 +289,66 @@ const Dashboard = () => {
           </Card>
         </div>
 
-        {/* Upcoming meetings */}
+        {/* My rooms (CRUD-backed) */}
+        <div>
+          <div className="flex items-center justify-between mb-5">
+            <div>
+              <h2 className="font-display text-2xl font-bold">Your rooms</h2>
+              <p className="text-muted-foreground text-sm">Rooms you host. Delete to revoke the invite link.</p>
+            </div>
+            <Button variant="ghost" size="sm" onClick={refreshRooms} disabled={loadingRooms}>Refresh</Button>
+          </div>
+          {myRooms.length === 0 ? (
+            <Card className="p-10 text-center text-muted-foreground">
+              {loadingRooms ? "Loading..." : "You haven't created any rooms yet. Use “New room with link” above to get started."}
+            </Card>
+          ) : (
+            <div className="grid md:grid-cols-3 gap-5">
+              {myRooms.map((r) => (
+                <Card key={r.roomId} className="overflow-hidden hover:shadow-elegant transition group">
+                  <div className="aspect-video overflow-hidden cursor-pointer relative" onClick={() => navigate(`/room/${r.roomId}`)}>
+                    {r.photo
+                      ? <img src={r.photo} alt={r.name} className="w-full h-full object-cover group-hover:scale-105 transition" />
+                      : <div className="w-full h-full bg-brand-gradient" />}
+                    {r.ended && (
+                      <div className="absolute top-2 right-2 text-xs bg-destructive text-destructive-foreground rounded-full px-2 py-0.5">Ended</div>
+                    )}
+                  </div>
+                  <div className="p-5">
+                    <h3 className="font-display font-bold text-lg mb-1 truncate">{r.name}</h3>
+                    <div className="text-xs text-muted-foreground truncate">{r.roomId}</div>
+                    <div className="flex items-center justify-between mt-3">
+                      <Button size="sm" variant="ghost" className="text-primary" onClick={() => navigate(`/room/${r.roomId}`)}>Join →</Button>
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
+                          <Button size="icon" variant="ghost" className="text-destructive hover:text-destructive">
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>Delete this room?</AlertDialogTitle>
+                            <AlertDialogDescription>
+                              The invite link for <strong>{r.name}</strong> will stop working immediately. This can't be undone.
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>Cancel</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => removeRoom(r.roomId)} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+                              Delete
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Upcoming (sample) */}
         <div>
           <div className="flex items-center justify-between mb-5">
             <h2 className="font-display text-2xl font-bold">Upcoming meetings</h2>

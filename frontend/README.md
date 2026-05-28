@@ -4,7 +4,8 @@
 
 SafeGuardMeet is a real-time communication platform for distributed teams who want fewer tabs and more flow. Encrypted HD video, persistent rooms, multi-user whiteboard, file sharing and reactions — in one beautifully secure workspace.
 
-Built by **Hydan Koech**.
+**Author:** Hydan Koech · **License:** MIT
+**Backend contributions are welcome and accepted** — see [`backend/`](./backend/README.md) and open a PR.
 
 ---
 
@@ -171,19 +172,109 @@ Open http://localhost:8080 (or the port Vite prints).
 
 ---
 
-## 🛣 Backend Roadmap (next steps)
+## 🔐 Secure Backend (Node.js + TypeScript)
 
-This MVP is **frontend-only with mock data**. To productionize:
+A production-shaped reference backend lives in [`backend/`](./backend) — built with **Node 20+ / TypeScript / Express / Socket.io / Zod / JWT / bcrypt / Helmet / pino**.
 
-1. **Auth** → Lovable Cloud (or Supabase): replace `AuthContext` localStorage with real JWT sessions.
-2. **Signaling** → Socket.io / WebSocket server emitting the same whiteboard event schema; swap `BroadcastChannel` for socket emit/subscribe.
-3. **Media** → WebRTC mesh (≤6) or SFU (mediasoup / LiveKit) for >6 participants. Replace stock images in `VideoGrid` with `<video srcObject={stream} />`.
-4. **Files** → Object storage (S3 / Lovable Cloud Storage) with signed URLs.
-5. **Chat** → Persist messages in Postgres; subscribe via WebSocket.
-6. **Recording** → Server-side mixer or per-track recording to object storage.
+### Run it
+
+```bash
+cd backend
+cp .env.example .env
+# generate strong secrets
+node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+npm install
+npm run dev          # http://localhost:4000
+```
+
+### Security defaults
+
+- TLS-terminated behind a proxy · `helmet()` security headers · strict CORS allow-list
+- JWT **access (15 m)** + **refresh (7 d)** with separate secrets · bcrypt cost 12
+- `zod` validation on every body · `express-rate-limit` (120 req/min/IP)
+- `pino` structured logs with secret redaction · centralized error handler (no stack leaks)
+- Socket.io handshake auth via JWT · host-only room mutations · per-room exclusive locks for screen-share & whiteboard
+
+### HTTP API (base `http://localhost:4000/api`)
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/auth/register` | – | Create account |
+| POST | `/auth/login` | – | Returns `{ user, accessToken, refreshToken }` |
+| POST | `/auth/refresh` | – | New access token from refresh token |
+| POST | `/rooms` | ✅ | Create room (you become host & default recorder) |
+| GET | `/rooms/:id` | ✅ | Fetch room metadata |
+| PATCH | `/rooms/:id` | ✅ host | Update name / photo / `recorderId` / `settings` |
+| POST | `/rooms/:id/end` | ✅ host | End meeting for everyone |
+| POST | `/files/sign-upload` | ✅ | S3-style signed upload URL |
+
+```bash
+TOKEN=$(curl -s localhost:4000/api/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"a@b.com","password":"demo1234"}' | jq -r .accessToken)
+
+curl localhost:4000/api/rooms \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"Standup"}'
+```
+
+### Realtime (Socket.io)
+
+Pass the access token via `auth.token` on connect. Events mirror the frontend's `BroadcastChannel` schema so the swap is mechanical:
+
+`room:join` · `chat:send` / `chat:new` · `webrtc:signal` · `screen:request|stop|started|stopped|denied` · `wb:request|stop|started|stopped|denied|event|sync-request|sync-response|clear` · `participant:joined|left`
+
+### Wiring the React frontend (already done ✅)
+
+The frontend ships **fully wired** to this backend. Behaviour is controlled by a single environment variable:
+
+```bash
+# .env (frontend)
+VITE_API_URL=http://localhost:4000
+```
+
+- **Unset** → the app runs in **local preview mode** (mocked auth, `localStorage`-backed rooms, simulated chat).
+  Useful for design previews and demos without a running backend.
+- **Set** → all auth, rooms CRUD, and realtime chat go through the Node/TS backend.
+
+Implementation map (already in the repo):
+
+| Concern | Frontend module | Backend endpoint / event |
+|---|---|---|
+| Login / register / refresh | `src/contexts/AuthContext.tsx` + `src/lib/api.ts` | `POST /api/auth/{login,register,refresh}` |
+| List my rooms + delete | `src/pages/Dashboard.tsx` → `api.listRooms()` / `api.deleteRoom()` | `GET /api/rooms`, `DELETE /api/rooms/:id` |
+| Create room (with privileges + cover photo) | `Dashboard.tsx` → `api.createRoom()` | `POST /api/rooms` |
+| Load room on join | `MeetingRoom.tsx` → `api.getRoom()` + socket `room:join` | `GET /api/rooms/:id` |
+| Update settings / recorder | `MeetingRoom.tsx` → `api.updateRoom()` | `PATCH /api/rooms/:id` |
+| Host ends meeting on leave | `MeetingRoom.tsx` → `api.endRoom()` | `POST /api/rooms/:id/end` |
+| Chat (history + live) | `src/components/meeting/ChatPanel.tsx` + `src/lib/socket.ts` | `GET /api/rooms/:id/messages`, socket `chat:send` / `chat:new` |
+| Exclusive screen / whiteboard locks | `MeetingRoom.tsx` socket listeners | `screen:*`, `wb:*` events |
+| File uploads | `FilesPanel.tsx` (signed-URL stub) | `POST /api/files/sign-upload` |
+
+Tokens are persisted in `localStorage` under `safeguardmeet.tokens` and auto-refreshed on `401`.
+Socket.io is opened lazily in `src/lib/socket.ts` only when both `VITE_API_URL` and an access token are present.
+
+### Production roadmap
+
+1. **Postgres** with `pg` + migrations (`users`, `rooms`, `room_members`, `messages`, `files`).
+2. **Refresh-token rotation** (hashed, single-use, revocable on logout).
+3. **WebRTC at scale** — mesh ≤6, then SFU (LiveKit / mediasoup) + coturn TURN servers.
+4. **Recording** via LiveKit Egress / mediasoup-recorder → S3.
+5. **Object storage** — wire `@aws-sdk/s3-request-presigner` in `routes/files.ts`.
+6. **Observability** — pino → Loki/Datadog; `/metrics` via `prom-client`.
+7. **Hardening** — CSRF (if cookie auth), audit logs, per-user rate limits, `npm audit` + Snyk.
+8. **Deploy** — Dockerfile + compose (api + postgres + redis + coturn) → Fly.io / Render / AWS ECS.
 
 ---
 
-## 📜 License
+## 🤝 Contributing
 
-© 2026 SafeGuardMeet by Hydan Koech. All rights reserved.
+**Backend contributions are welcome and accepted.** Fork → `feat/<short-name>` branch → PR.
+Run `npm run lint && npm test` in `backend/` before pushing. Keep handlers thin; validate every input with `zod`.
+
+---
+
+## 📜 License & Author
+
+MIT © 2026 **Hydan Koech** — SafeGuardMeet.

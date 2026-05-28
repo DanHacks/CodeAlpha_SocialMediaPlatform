@@ -9,6 +9,8 @@ import { FilesPanel } from "@/components/meeting/FilesPanel";
 import { ParticipantsPanel } from "@/components/meeting/ParticipantsPanel";
 import { mockParticipants, Participant } from "@/lib/mockData";
 import { roomStore, makeDefault, RoomMeta, RoomSettings } from "@/lib/roomStore";
+import { api, isApiEnabled, apiRoomToMeta } from "@/lib/api";
+import { getSocket } from "@/lib/socket";
 import { useAuth } from "@/contexts/AuthContext";
 import {
   Mic, MicOff, Video, VideoOff, ScreenShare, ScreenShareOff, PhoneOff, Hand, Smile,
@@ -51,6 +53,41 @@ const MeetingRoom = () => {
   useEffect(() => roomStore.subscribe((map) => {
     if (roomId && map[roomId]) setRoom(map[roomId]);
   }), [roomId]);
+
+  // If backend is wired, fetch authoritative room metadata + join socket room.
+  useEffect(() => {
+    if (!roomId) return;
+    if (isApiEnabled()) {
+      api.getRoom(roomId).then((r) => {
+        const meta = apiRoomToMeta(r);
+        roomStore.upsert(meta);
+        setRoom(meta);
+      }).catch(() => { /* fall back to local */ });
+    }
+    const socket = getSocket();
+    if (socket && roomId) {
+      socket.emit("room:join", { roomId });
+      const onEnded = () => roomStore.end(roomId);
+      const onScreenStarted = ({ userId }: { userId: string }) =>
+        roomStore.patch(roomId, { activeScreenSharer: { id: userId, name: userId } });
+      const onScreenStopped = () => roomStore.patch(roomId, { activeScreenSharer: null });
+      const onWbStarted = ({ userId }: { userId: string }) =>
+        roomStore.patch(roomId, { activeWhiteboardSharer: { id: userId, name: userId } });
+      const onWbStopped = () => roomStore.patch(roomId, { activeWhiteboardSharer: null });
+      socket.on("room:ended", onEnded);
+      socket.on("screen:started", onScreenStarted);
+      socket.on("screen:stopped", onScreenStopped);
+      socket.on("wb:started", onWbStarted);
+      socket.on("wb:stopped", onWbStopped);
+      return () => {
+        socket.off("room:ended", onEnded);
+        socket.off("screen:started", onScreenStarted);
+        socket.off("screen:stopped", onScreenStopped);
+        socket.off("wb:started", onWbStarted);
+        socket.off("wb:stopped", onWbStopped);
+      };
+    }
+  }, [roomId]);
 
   // Detect ended state
   const [endedDialogOpen, setEndedDialogOpen] = useState(false);
@@ -177,6 +214,7 @@ const MeetingRoom = () => {
     if (isHost) {
       // Host leaving ends the meeting for all
       roomStore.end(room.roomId);
+      if (isApiEnabled()) api.endRoom(room.roomId).catch(() => { /* best-effort */ });
       toast.success("You ended the meeting for everyone");
     } else {
       // Clean up any locks held by me
@@ -200,7 +238,17 @@ const MeetingRoom = () => {
   );
 
   const updateSettings = (patch: Partial<RoomSettings>) => {
-    roomStore.patch(room.roomId, { settings: { ...room.settings, ...patch } });
+    const merged = { ...room.settings, ...patch };
+    roomStore.patch(room.roomId, { settings: merged });
+    if (isApiEnabled() && isHost) {
+      api.updateRoom(room.roomId, { settings: patch }).catch(() => toast.error("Failed to save settings"));
+    }
+  };
+  const updateRecorder = (id: string) => {
+    roomStore.patch(room.roomId, { recorderId: id });
+    if (isApiEnabled() && isHost) {
+      api.updateRoom(room.roomId, { recorderId: id }).catch(() => toast.error("Failed to update recorder"));
+    }
   };
 
   return (
@@ -265,7 +313,7 @@ const MeetingRoom = () => {
             {panel === "people" && <PanelHeader title="Participants" onClose={() => setPanel(null)} />}
             {panel === "files" && <PanelHeader title="Files" onClose={() => setPanel(null)} />}
             <div className="flex-1 overflow-hidden">
-              {panel === "chat" && <ChatPanel />}
+              {panel === "chat" && <ChatPanel roomId={roomId} />}
               {panel === "people" && <ParticipantsPanel participants={participants} />}
               {panel === "files" && <FilesPanel />}
             </div>
@@ -354,7 +402,7 @@ const MeetingRoom = () => {
             <div className="space-y-2 rounded-lg border p-4">
               <Label className="text-sm font-semibold">Designated recorder</Label>
               <p className="text-xs text-muted-foreground">Choose who is allowed to start/stop the recording.</p>
-              <Select value={room.recorderId || ""} onValueChange={(v) => roomStore.patch(room.roomId, { recorderId: v })}>
+              <Select value={room.recorderId || ""} onValueChange={updateRecorder}>
                 <SelectTrigger><SelectValue placeholder="Select participant" /></SelectTrigger>
                 <SelectContent>
                   {recorderOptions.map((p) => (
